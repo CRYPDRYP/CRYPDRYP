@@ -1,10 +1,14 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Install Hermes Agent inside Termux on Android (e.g. Solana Seeker).
 #
-# Bypasses Hermes's own shell installer (which downloads Chromium/ffmpeg from
-# hosts that don't cleanly serve Android/aarch64) and installs the CLI via pip
-# straight from PyPI. Also configures Anthropic Claude as the provider and
-# runs a smoke test to confirm the install works end-to-end.
+# Uses Nous Research's official signed APT repo — the ONLY supported path
+# on Termux. Pip does not work (psutil hard-rejects Android at build time).
+#
+# STATUS (2026-09): Nous documents the Termux package as currently broken
+# with a fix in progress. This script sets up the correct repo so it will
+# work as soon as their fix ships. Try it; if `pkg install hermes-agent`
+# succeeds, you're set; if not, the officially supported install is not
+# available yet on Termux.
 #
 # Run inside Termux:
 #   bash install-hermes-termux.sh
@@ -18,75 +22,71 @@ if [ ! -d /data/data/com.termux ]; then
 fi
 
 DEFAULT_MODEL="${HERMES_MODEL:-claude-opus-4-6}"
+KEY_URL="https://hermes-assets.nousresearch.com/releases/termux/stable/key.asc"
+REPO_URL="https://hermes-assets.nousresearch.com/releases/termux/stable"
+EXPECTED_FP="C572 B5FD D1A2 9CCF A9A9 12B6 840B 0848 E139 156D"
 
 step() { printf '\n\033[1;36m>>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
-step "Updating Termux packages"
-pkg update -y >/dev/null 2>&1 || warn "pkg update had warnings (continuing)"
+step "Installing prerequisites (curl, gnupg)"
+pkg install -y curl gnupg >/dev/null || die "pkg install curl gnupg failed"
 
-step "Installing build toolchain and Python"
-# python: interpreter. git: version control. rust + clang + binutils + make + pkg-config:
-# needed to build cryptography / pydantic-core / uvloop wheels from source on aarch64.
-# libffi + openssl + libjpeg-turbo + libcrypt + zlib: native lib deps for those wheels.
-pkg install -y \
-  python git rust clang binutils make pkg-config \
-  libffi openssl libjpeg-turbo libcrypt zlib \
-  >/dev/null || die "package install failed — run 'pkg install python git rust clang' manually to see the error"
-ok "toolchain ready"
+step "Downloading Nous Research signing key"
+mkdir -p "$PREFIX/etc/apt/keyrings"
+curl -fsSL "$KEY_URL" -o "$PREFIX/etc/apt/keyrings/hermes-agent.asc" \
+  || die "could not download signing key from $KEY_URL"
 
-step "Installing hermes-agent from PyPI (first run compiles wheels — 5–15 min)"
-# Termux blocks 'pip install pip' — its python-pip package ships its own pip;
-# self-upgrading breaks that. Use whatever pip Termux gave us.
-python -m pip install --user --upgrade hermes-agent \
-  || die "pip install hermes-agent failed — scroll up for the wheel that broke"
+step "Verifying key fingerprint"
+actual_fp=$(gpg --show-keys --with-fingerprint "$PREFIX/etc/apt/keyrings/hermes-agent.asc" 2>/dev/null \
+  | grep -Eo '([0-9A-F]{4} ){9}[0-9A-F]{4}' | head -1)
+if [ "$actual_fp" = "$EXPECTED_FP" ]; then
+  ok "fingerprint matches: $EXPECTED_FP"
+else
+  die "fingerprint mismatch! expected $EXPECTED_FP, got $actual_fp — do not proceed"
+fi
 
-# Make hermes available in this shell and future shells.
-export PATH="$HOME/.local/bin:$PATH"
-for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
-  [ -f "$rc" ] || continue
-  grep -q 'HOME/.local/bin' "$rc" 2>/dev/null && continue
-  echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
-done
+step "Adding Hermes APT repo"
+printf '%s\n' \
+  "deb [signed-by=$PREFIX/etc/apt/keyrings/hermes-agent.asc] $REPO_URL hermes-stable main" \
+  > "$PREFIX/etc/apt/sources.list.d/hermes-agent.list"
+ok "repo added: $PREFIX/etc/apt/sources.list.d/hermes-agent.list"
 
-command -v hermes >/dev/null 2>&1 || die "hermes not on PATH after install — try opening a new Termux tab"
-ok "installed: $(hermes --version 2>/dev/null | head -1)"
+step "Updating package lists"
+pkg update -y 2>&1 | tail -5
+
+step "Installing hermes-agent"
+if ! pkg install -y hermes-agent 2>&1 | tee /tmp/hermes-install.log; then
+  echo
+  warn "pkg install hermes-agent failed."
+  warn "Nous Research currently documents this package as broken —"
+  warn "  \"The Termux package does not work right now. A fix is in progress.\""
+  warn "  https://hermes-agent.nousresearch.com/docs/getting-started/termux"
+  warn "Retry this script after they announce the fix."
+  exit 1
+fi
+ok "installed: $(hermes --version 2>/dev/null | head -1 || echo hermes)"
 
 step "Pinning provider=anthropic, model=$DEFAULT_MODEL"
 hermes config set model.provider anthropic >/dev/null
 hermes config set model.default "$DEFAULT_MODEL" >/dev/null
-ok "config written to ~/.hermes/config.yaml"
+ok "config written"
 
 step "Registering Anthropic credential"
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   hermes auth add anthropic --type api-key --api-key "$ANTHROPIC_API_KEY" >/dev/null \
-    && ok "API key from ANTHROPIC_API_KEY registered"
+    && ok "API key registered"
 elif [ -t 0 ]; then
   echo "   Paste your Anthropic API key (starts with sk-ant-...) then press Enter."
-  echo "   Get one at: https://console.anthropic.com/settings/keys"
   hermes auth add anthropic --type api-key
 else
-  warn "no API key provided and not running interactively — register one later with:"
-  echo "     hermes auth add anthropic --type api-key"
+  warn "no API key provided and not running interactively"
+  warn "run this later: hermes auth add anthropic --type api-key"
 fi
 
-step "Enabling wake-lock so background features survive Android's doze"
-if command -v termux-wake-lock >/dev/null 2>&1; then
-  termux-wake-lock && ok "wake-lock on" || warn "wake-lock failed (harmless if you don't use cron/gateway)"
-fi
-
-step "Smoke test: asking Claude to reply"
-if hermes auth list 2>/dev/null | grep -q 'anthropic'; then
-  if timeout 60 hermes -z "Reply with exactly: hermes ready" --provider anthropic --model "$DEFAULT_MODEL" 2>/dev/null | grep -qi 'hermes ready'; then
-    ok "Claude round-trip works"
-  else
-    warn "smoke test did not return expected reply — key may be invalid or network is blocked"
-  fi
-else
-  warn "smoke test skipped — no anthropic credential registered"
-fi
+command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null || true
 
 cat <<EOF
 
@@ -96,9 +96,5 @@ cat <<EOF
 │   hermes                     # chat TUI      │
 │   hermes dashboard           # web UI        │
 │   hermes -z "question"       # one-shot      │
-│                                              │
-│ If you opened a NEW Termux tab and 'hermes'  │
-│ isn't found, run:                            │
-│   export PATH="\$HOME/.local/bin:\$PATH"       │
 ╰──────────────────────────────────────────────╯
 EOF
