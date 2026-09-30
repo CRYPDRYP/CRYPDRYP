@@ -37,10 +37,9 @@ pkg install -y \
   >/dev/null || die "package install failed — run 'pkg install python git rust clang' manually to see the error"
 ok "toolchain ready"
 
-step "Upgrading pip"
-python -m pip install --user --upgrade --quiet pip
-
 step "Installing hermes-agent from PyPI (first run compiles wheels — 5–15 min)"
+# Termux blocks 'pip install pip' — its python-pip package ships its own pip;
+# self-upgrading breaks that. Use whatever pip Termux gave us.
 python -m pip install --user --upgrade hermes-agent \
   || die "pip install hermes-agent failed — scroll up for the wheel that broke"
 
